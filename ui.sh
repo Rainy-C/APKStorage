@@ -1,0 +1,764 @@
+#!/bin/bash
+
+red='\033[0;31m'
+green='\033[0;32m'
+blue='\033[0;34m'
+yellow='\033[0;33m'
+plain='\033[0m'
+
+cur_dir=$(pwd)
+
+xui_folder="${XUI_MAIN_FOLDER:=/usr/local/x-ui}"
+xui_service="${XUI_SERVICE:=/etc/systemd/system}"
+
+# 检查root权限
+[[ $EUID -ne 0 ]] && echo -e "${red}致命错误: ${plain} 请以root权限运行此脚本 \n " && exit 1
+
+# 检查操作系统并设置release变量
+if [[ -f /etc/os-release ]]; then
+    source /etc/os-release
+    release=$ID
+    elif [[ -f /usr/lib/os-release ]]; then
+    source /usr/lib/os-release
+    release=$ID
+else
+    echo "无法检查系统版本, 请联系脚本作者!" >&2
+    exit 1
+fi
+echo "操作系统版本是: $release"
+
+arch() {
+    case "$(uname -m)" in
+        x86_64 | x64 | amd64) echo 'amd64' ;;
+        i*86 | x86) echo '386' ;;
+        armv8* | armv8 | arm64 | aarch64) echo 'arm64' ;;
+        armv7* | armv7 | arm) echo 'armv7' ;;
+        armv6* | armv6) echo 'armv6' ;;
+        armv5* | armv5) echo 'armv5' ;;
+        s390x) echo 's390x' ;;
+        *) echo -e "${green}不支持的CPU架构! ${plain}" && rm -f install.sh && exit 1 ;;
+    esac
+}
+
+echo "架构: $(arch)"
+
+# 简单辅助函数
+is_ipv4() {
+    [[ "$1" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] && return 0 || return 1
+}
+is_ipv6() {
+    [[ "$1" =~ : ]] && return 0 || return 1
+}
+is_ip() {
+    is_ipv4 "$1" || is_ipv6 "$1"
+}
+is_domain() {
+    [[ "$1" =~ ^([A-Za-z0-9](-*[A-Za-z0-9])*\.)+[A-Za-z]{2,}$ ]] && return 0 || return 1
+}
+
+install_base() {
+    case "${release}" in
+        ubuntu | debian | armbian)
+            apt-get update && apt-get install -y -q curl tar tzdata openssl socat
+        ;;
+        fedora | amzn | virtuozzo | rhel | almalinux | rocky | ol)
+            dnf -y update && dnf install -y -q curl tar tzdata openssl socat
+        ;;
+        centos)
+            if [[ "${VERSION_ID}" =~ ^7 ]]; then
+                yum -y update && yum install -y curl tar tzdata openssl socat
+            else
+                dnf -y update && dnf install -y -q curl tar tzdata openssl socat
+            fi
+        ;;
+        arch | manjaro | parch)
+            pacman -Syu && pacman -Syu --noconfirm curl tar tzdata openssl socat
+        ;;
+        opensuse-tumbleweed | opensuse-leap)
+            zypper refresh && zypper -q install -y curl tar timezone openssl socat
+        ;;
+        alpine)
+            apk update && apk add curl tar tzdata openssl socat
+        ;;
+        *)
+            apt-get update && apt-get install -y -q curl tar tzdata openssl socat
+        ;;
+    esac
+}
+
+gen_random_string() {
+    local length="$1"
+    local random_string=$(LC_ALL=C tr -dc 'a-zA-Z0-9' </dev/urandom | fold -w "$length" | head -n 1)
+    echo "$random_string"
+}
+
+install_acme() {
+    echo -e "${green}正在为SSL证书管理安装acme.sh...${plain}"
+    cd ~ || return 1
+    curl -s https://get.acme.sh | sh >/dev/null 2>&1
+    if [ $? -ne 0 ]; then
+        echo -e "${red}acme.sh 安装失败${plain}"
+        return 1
+    else
+        echo -e "${green}acme.sh 安装成功${plain}"
+    fi
+    return 0
+}
+
+setup_ssl_certificate() {
+    local domain="$1"
+    local server_ip="$2"
+    local existing_port="$3"
+    local existing_webBasePath="$4"
+    
+    echo -e "${green}正在设置SSL证书...${plain}"
+    
+    # 检查acme.sh是否已安装
+    if ! command -v ~/.acme.sh/acme.sh &>/dev/null; then
+        install_acme
+        if [ $? -ne 0 ]; then
+            echo -e "${yellow}acme.sh 安装失败, 跳过SSL设置${plain}"
+            return 1
+        fi
+    fi
+    
+    # 创建证书目录
+    local certPath="/root/cert/${domain}"
+    mkdir -p "$certPath"
+    
+    # 签发证书
+    echo -e "${green}正在为 ${domain} 签发SSL证书...${plain}"
+    echo -e "${yellow}注意: 80端口必须开放且可从互联网访问${plain}"
+    
+    ~/.acme.sh/acme.sh --set-default-ca --server letsencrypt >/dev/null 2>&1
+    ~/.acme.sh/acme.sh --issue -d ${domain} --listen-v6 --standalone --httpport 80 --force
+    
+    if [ $? -ne 0 ]; then
+        echo -e "${yellow}为 ${domain} 签发证书失败${plain}"
+        echo -e "${yellow}请确保80端口已开放, 稍后可使用 x-ui 命令重试${plain}"
+        rm -rf ~/.acme.sh/${domain} 2>/dev/null
+        rm -rf "$certPath" 2>/dev/null
+        return 1
+    fi
+    
+    # 安装证书
+    ~/.acme.sh/acme.sh --installcert -d ${domain} \
+        --key-file /root/cert/${domain}/privkey.pem \
+        --fullchain-file /root/cert/${domain}/fullchain.pem \
+        --reloadcmd "systemctl restart x-ui" >/dev/null 2>&1
+    
+    if [ $? -ne 0 ]; then
+        echo -e "${yellow}证书安装失败${plain}"
+        return 1
+    fi
+    
+    # 启用自动续签
+    ~/.acme.sh/acme.sh --upgrade --auto-upgrade >/dev/null 2>&1
+    chmod 755 $certPath/* 2>/dev/null
+    
+    # 为面板设置证书
+    local webCertFile="/root/cert/${domain}/fullchain.pem"
+    local webKeyFile="/root/cert/${domain}/privkey.pem"
+    
+    if [[ -f "$webCertFile" && -f "$webKeyFile" ]]; then
+        ${xui_folder}/x-ui cert -webCert "$webCertFile" -webCertKey "$webKeyFile" >/dev/null 2>&1
+        echo -e "${green}SSL证书安装并配置成功!${plain}"
+        return 0
+    else
+        echo -e "${yellow}未找到证书文件${plain}"
+        return 1
+    fi
+}
+
+# 备用方案: 生成自签名证书 (非公开信任)
+setup_self_signed_certificate() {
+    local name="$1"   # 用于SAN的域名或IP
+    local certDir="/root/cert/selfsigned"
+
+    echo -e "${yellow}正在生成自签名证书 (非公开信任)...${plain}"
+
+    mkdir -p "$certDir"
+
+    local sanExt=""
+    if is_ip "$name"; then
+        sanExt="IP:${name}"
+    else
+        sanExt="DNS:${name}"
+    fi
+
+    # 如果支持, 使用 -addext; 否则回退到使用配置文件
+    openssl req -x509 -nodes -newkey rsa:2048 -days 365 \
+        -keyout "${certDir}/privkey.pem" \
+        -out "${certDir}/fullchain.pem" \
+        -subj "/CN=${name}" \
+        -addext "subjectAltName=${sanExt}" >/dev/null 2>&1
+
+    if [[ $? -ne 0 ]]; then
+        # 通过临时配置文件回退 (适用于旧版OpenSSL)
+        local tmpCfg="${certDir}/openssl.cnf"
+        cat > "$tmpCfg" <<EOF
+[req]
+distinguished_name=req_distinguished_name
+req_extensions=v3_req
+[req_distinguished_name]
+[v3_req]
+subjectAltName=${sanExt}
+EOF
+        openssl req -x509 -nodes -newkey rsa:2048 -days 365 \
+            -keyout "${certDir}/privkey.pem" \
+            -out "${certDir}/fullchain.pem" \
+            -subj "/CN=${name}" \
+            -config "$tmpCfg" -extensions v3_req >/dev/null 2>&1
+        rm -f "$tmpCfg"
+    fi
+
+    if [[ ! -f "${certDir}/fullchain.pem" || ! -f "${certDir}/privkey.pem" ]]; then
+        echo -e "${red}生成自签名证书失败${plain}"
+        return 1
+    fi
+
+    chmod 755 ${certDir}/* 2>/dev/null
+    ${xui_folder}/x-ui cert -webCert "${certDir}/fullchain.pem" -webCertKey "${certDir}/privkey.pem" >/dev/null 2>&1
+    echo -e "${yellow}自签名证书已配置。浏览器会显示安全警告。${plain}"
+    return 0
+}
+
+# 通过acme.sh进行全面的手动SSL证书签发
+ssl_cert_issue() {
+    local existing_webBasePath=$(${xui_folder}/x-ui setting -show true | grep 'webBasePath:' | awk -F': ' '{print $2}' | tr -d '[:space:]' | sed 's#^/##')
+    local existing_port=$(${xui_folder}/x-ui setting -show true | grep 'port:' | awk -F': ' '{print $2}' | tr -d '[:space:]')
+    
+    # 首先检查acme.sh
+    if ! command -v ~/.acme.sh/acme.sh &>/dev/null; then
+        echo "找不到 acme.sh。现在开始安装..."
+        cd ~ || return 1
+        curl -s https://get.acme.sh | sh
+        if [ $? -ne 0 ]; then
+            echo -e "${red}acme.sh 安装失败${plain}"
+            return 1
+        else
+            echo -e "${green}acme.sh 安装成功${plain}"
+        fi
+    fi
+
+    # 获取域名并验证
+    local domain=""
+    while true; do
+        read -rp "请输入您的域名: " domain
+        domain="${domain// /}"  # 去除空白字符
+        
+        if [[ -z "$domain" ]]; then
+            echo -e "${red}域名不能为空。请重试。${plain}"
+            continue
+        fi
+        
+        if ! is_domain "$domain"; then
+            echo -e "${red}域名格式无效: ${domain}。请输入一个有效的域名。${plain}"
+            continue
+        fi
+        
+        break
+    done
+    echo -e "${green}您的域名是: ${domain}, 正在检查...${plain}"
+
+    # 检查是否已存在证书
+    local currentCert=$(~/.acme.sh/acme.sh --list | tail -1 | awk '{print $1}')
+    if [ "${currentCert}" == "${domain}" ]; then
+        local certInfo=$(~/.acme.sh/acme.sh --list)
+        echo -e "${red}系统已存在此域名的证书。无法重复签发。${plain}"
+        echo -e "${yellow}当前证书详情:${plain}"
+        echo "$certInfo"
+        return 1
+    else
+        echo -e "${green}您的域名现在可以签发证书了...${plain}"
+    fi
+
+    # 创建证书目录
+    certPath="/root/cert/${domain}"
+    if [ ! -d "$certPath" ]; then
+        mkdir -p "$certPath"
+    else
+        rm -rf "$certPath"
+        mkdir -p "$certPath"
+    fi
+
+    # 获取独立服务器的端口号
+    local WebPort=80
+    read -rp "请选择要使用的端口 (默认为 80): " WebPort
+    if [[ ${WebPort} -gt 65535 || ${WebPort} -lt 1 ]]; then
+        echo -e "${yellow}您输入的 ${WebPort} 无效, 将使用默认端口 80。${plain}"
+        WebPort=80
+    fi
+    echo -e "${green}将使用端口: ${WebPort} 来签发证书。请确保此端口已开放。${plain}"
+
+    # 临时停止面板
+    echo -e "${yellow}临时停止面板...${plain}"
+    systemctl stop x-ui 2>/dev/null || rc-service x-ui stop 2>/dev/null
+
+    # 签发证书
+    ~/.acme.sh/acme.sh --set-default-ca --server letsencrypt
+    ~/.acme.sh/acme.sh --issue -d ${domain} --listen-v6 --standalone --httpport ${WebPort} --force
+    if [ $? -ne 0 ]; then
+        echo -e "${red}证书签发失败, 请检查日志。${plain}"
+        rm -rf ~/.acme.sh/${domain}
+        systemctl start x-ui 2>/dev/null || rc-service x-ui start 2>/dev/null
+        return 1
+    else
+        echo -e "${green}证书签发成功, 正在安装证书...${plain}"
+    fi
+
+    # 设置重载命令
+    reloadCmd="systemctl restart x-ui || rc-service x-ui restart"
+    echo -e "${green}ACME的默认--reloadcmd是: ${yellow}systemctl restart x-ui || rc-service x-ui restart${plain}"
+    echo -e "${green}此命令将在每次证书签发和续签时运行。${plain}"
+    read -rp "您想修改ACME的--reloadcmd吗? (y/n): " setReloadcmd
+    if [[ "$setReloadcmd" == "y" || "$setReloadcmd" == "Y" ]]; then
+        echo -e "\n${green}\t1.${plain} 预设: systemctl reload nginx ; systemctl restart x-ui"
+        echo -e "${green}\t2.${plain} 输入您自己的命令"
+        echo -e "${green}\t0.${plain} 保留默认reloadcmd"
+        read -rp "请选择一个选项: " choice
+        case "$choice" in
+        1)
+            echo -e "${green}Reloadcmd是: systemctl reload nginx ; systemctl restart x-ui${plain}"
+            reloadCmd="systemctl reload nginx ; systemctl restart x-ui"
+            ;;
+        2)
+            echo -e "${yellow}建议将x-ui重启命令放在最后${plain}"
+            read -rp "请输入您的自定义reloadcmd: " reloadCmd
+            echo -e "${green}Reloadcmd是: ${reloadCmd}${plain}"
+            ;;
+        *)
+            echo -e "${green}保留默认reloadcmd${plain}"
+            ;;
+        esac
+    fi
+
+    # 安装证书
+    ~/.acme.sh/acme.sh --installcert -d ${domain} \
+        --key-file /root/cert/${domain}/privkey.pem \
+        --fullchain-file /root/cert/${domain}/fullchain.pem --reloadcmd "${reloadCmd}"
+
+    if [ $? -ne 0 ]; then
+        echo -e "${red}证书安装失败, 退出。${plain}"
+        rm -rf ~/.acme.sh/${domain}
+        systemctl start x-ui 2>/dev/null || rc-service x-ui start 2>/dev/null
+        return 1
+    else
+        echo -e "${green}证书安装成功, 正在启用自动续签...${plain}"
+    fi
+
+    # 启用自动续签
+    ~/.acme.sh/acme.sh --upgrade --auto-upgrade
+    if [ $? -ne 0 ]; then
+        echo -e "${yellow}自动续签设置存在问题, 证书详情:${plain}"
+        ls -lah /root/cert/${domain}/
+        chmod 755 $certPath/*
+    else
+        echo -e "${green}自动续签成功, 证书详情:${plain}"
+        ls -lah /root/cert/${domain}/
+        chmod 755 $certPath/*
+    fi
+
+    # 重启面板
+    systemctl start x-ui 2>/dev/null || rc-service x-ui start 2>/dev/null
+
+    # 成功安装证书后提示用户设置面板路径
+    read -rp "您想为面板设置此证书吗? (y/n): " setPanel
+    if [[ "$setPanel" == "y" || "$setPanel" == "Y" ]]; then
+        local webCertFile="/root/cert/${domain}/fullchain.pem"
+        local webKeyFile="/root/cert/${domain}/privkey.pem"
+
+        if [[ -f "$webCertFile" && -f "$webKeyFile" ]]; then
+            ${xui_folder}/x-ui cert -webCert "$webCertFile" -webCertKey "$webKeyFile"
+            echo -e "${green}已为面板设置证书路径${plain}"
+            echo -e "${green}证书文件: $webCertFile${plain}"
+            echo -e "${green}私钥文件: $webKeyFile${plain}"
+            echo ""
+            echo -e "${green}访问地址: https://${domain}:${existing_port}/${existing_webBasePath}${plain}"
+            echo -e "${yellow}面板将重启以应用SSL证书...${plain}"
+            systemctl restart x-ui 2>/dev/null || rc-service x-ui restart 2>/dev/null
+        else
+            echo -e "${red}错误: 未找到域名: $domain 的证书或私钥文件。${plain}"
+        fi
+    else
+        echo -e "${yellow}跳过面板路径设置。${plain}"
+    fi
+    
+    return 0
+}
+
+# 可重用的交互式SSL设置 (域名或自签名)
+# 将全局 `SSL_HOST` 设置为所选的域名/IP, 以便在访问URL中使用
+prompt_and_setup_ssl() {
+    local panel_port="$1"
+    local web_base_path="$2"   # 预期不带前导斜杠
+    local server_ip="$3"
+
+    local ssl_choice=""
+
+    echo -e "${yellow}请选择SSL证书设置方式:${plain}"
+    echo -e "${green}1.${plain} Let's Encrypt (需要域名, 推荐)"
+    echo -e "${green}2.${plain} 自签名证书 (非公开信任)"
+    read -rp "请选择一个选项 (默认为 2): " ssl_choice
+    ssl_choice="${ssl_choice// /}"  # 去除空白字符
+    
+    # 如果不是1, 则默认为2 (自签名)
+    if [[ "$ssl_choice" != "1" ]]; then
+        ssl_choice="2"
+    fi
+
+    case "$ssl_choice" in
+    1)
+        # 用户选择Let's Encrypt域名选项
+        echo -e "${green}使用 ssl_cert_issue()进行全面的域名设置...${plain}"
+        ssl_cert_issue
+        # 从证书中提取使用的域名
+        local cert_domain=$(~/.acme.sh/acme.sh --list 2>/dev/null | tail -1 | awk '{print $1}')
+        if [[ -n "${cert_domain}" ]]; then
+            SSL_HOST="${cert_domain}"
+            echo -e "${green}✓ SSL证书已成功配置, 域名为: ${cert_domain}${plain}"
+        else
+            echo -e "${yellow}SSL设置可能已完成, 但域名提取失败${plain}"
+            SSL_HOST="${server_ip}"
+        fi
+        ;;
+    2)
+        # 用户选择自签名选项
+        # 如果面板正在运行, 则停止它
+        if [[ $release == "alpine" ]]; then
+            rc-service x-ui stop >/dev/null 2>&1
+        else
+            systemctl stop x-ui >/dev/null 2>&1
+        fi
+        echo -e "${yellow}使用服务器IP生成自签名证书: ${server_ip}${plain}"
+        setup_self_signed_certificate "${server_ip}"
+        if [ $? -eq 0 ]; then
+            SSL_HOST="${server_ip}"
+            echo -e "${green}✓ 自签名SSL配置成功${plain}"
+        else
+            echo -e "${red}✗ 自签名SSL设置失败${plain}"
+            SSL_HOST="${server_ip}"
+        fi
+        # SSL配置后启动面板
+        if [[ $release == "alpine" ]]; then
+            rc-service x-ui start >/dev/null 2>&1
+        else
+            systemctl start x-ui >/dev/null 2>&1
+        fi
+        ;;
+    *)
+        echo -e "${red}无效选项。跳过SSL设置。${plain}"
+        SSL_HOST="${server_ip}"
+        ;;
+    esac
+}
+
+config_after_install() {
+    local existing_hasDefaultCredential=$(${xui_folder}/x-ui setting -show true | grep -Eo 'hasDefaultCredential: .+' | awk '{print $2}')
+    local existing_webBasePath=$(${xui_folder}/x-ui setting -show true | grep -Eo 'webBasePath: .+' | awk '{print $2}' | sed 's#^/##')
+    local existing_port=$(${xui_folder}/x-ui setting -show true | grep -Eo 'port: .+' | awk '{print $2}')
+    # 通过检查cert:行是否存在且其后有内容来正确检测空证书
+    local existing_cert=$(${xui_folder}/x-ui setting -getCert true | grep 'cert:' | awk -F': ' '{print $2}' | tr -d '[:space:]')
+    local URL_lists=(
+        "https://api4.ipify.org"
+        "https://ipv4.icanhazip.com"
+        "https://v4.api.ipinfo.io/ip"
+        "https://ipv4.myexternalip.com/raw"
+        "https://4.ident.me"
+        "https://check-host.net/ip"
+    )
+    local server_ip=""
+    for ip_address in "${URL_lists[@]}"; do
+        server_ip=$(curl -s --max-time 3 "${ip_address}" 2>/dev/null | tr -d '[:space:]')
+        if [[ -n "${server_ip}" ]]; then
+            break
+        fi
+    done
+    
+    if [[ ${#existing_webBasePath} -lt 4 ]]; then
+        if [[ "$existing_hasDefaultCredential" == "true" ]]; then
+            local config_webBasePath=$(gen_random_string 18)
+            local config_username=$(gen_random_string 10)
+            local config_password=$(gen_random_string 10)
+            
+            read -rp "您想自定义面板端口设置吗? (否则将应用随机端口) [y/n]: " config_confirm
+            if [[ "${config_confirm}" == "y" || "${config_confirm}" == "Y" ]]; then
+                read -rp "请设置面板端口: " config_port
+                echo -e "${yellow}您的面板端口是: ${config_port}${plain}"
+            else
+                local config_port=$(shuf -i 1024-62000 -n 1)
+                echo -e "${yellow}已生成随机端口: ${config_port}${plain}"
+            fi
+            
+            ${xui_folder}/x-ui setting -username "${config_username}" -password "${config_password}" -port "${config_port}" -webBasePath "${config_webBasePath}"
+            
+            echo ""
+            echo -e "${green}═══════════════════════════════════════════${plain}"
+            echo -e "${green}     SSL 证书设置 (强制)     ${plain}"
+            echo -e "${green}═══════════════════════════════════════════${plain}"
+            echo -e "${yellow}为安全起见, 所有面板都必须使用SSL证书。${plain}"
+            echo -e "${yellow}Let's Encrypt需要一个域名 (不签发IP证书)。${plain}"
+            echo ""
+
+            prompt_and_setup_ssl "${config_port}" "${config_webBasePath}" "${server_ip}"
+            
+            # 显示最终凭据和访问信息
+            echo ""
+            echo -e "${green}═══════════════════════════════════════════${plain}"
+            echo -e "${green}     面板安装完成!         ${plain}"
+            echo -e "${green}═══════════════════════════════════════════${plain}"
+            echo -e "${green}用户名:    ${config_username}${plain}"
+            echo -e "${green}密码:      ${config_password}${plain}"
+            echo -e "${green}端口:        ${config_port}${plain}"
+            echo -e "${green}访问路径: ${config_webBasePath}${plain}"
+            echo -e "${green}访问地址:  https://${SSL_HOST}:${config_port}/${config_webBasePath}${plain}"
+            echo -e "${green}═══════════════════════════════════════════${plain}"
+            echo -e "${yellow}⚠ 重要提示: 请安全地保存这些凭据!${plain}"
+            echo -e "${yellow}⚠ SSL 证书: 已启用并配置${plain}"
+        else
+            local config_webBasePath=$(gen_random_string 18)
+            echo -e "${yellow}访问路径缺失或太短。正在生成新的...${plain}"
+            ${xui_folder}/x-ui setting -webBasePath "${config_webBasePath}"
+            echo -e "${green}新的访问路径: ${config_webBasePath}${plain}"
+
+            # 如果面板已安装但未配置证书, 现在提示进行SSL设置
+            if [[ -z "${existing_cert}" ]]; then
+                echo ""
+                echo -e "${green}═══════════════════════════════════════════${plain}"
+                echo -e "${green}     SSL 证书设置 (推荐)   ${plain}"
+                echo -e "${green}═══════════════════════════════════════════${plain}"
+                echo -e "${yellow}Let's Encrypt需要一个域名 (不签发IP证书)。${plain}"
+                echo ""
+                prompt_and_setup_ssl "${existing_port}" "${config_webBasePath}" "${server_ip}"
+                echo -e "${green}访问地址:  https://${SSL_HOST}:${existing_port}/${config_webBasePath}${plain}"
+            else
+                # 如果已存在证书, 只显示访问URL
+                echo -e "${green}访问地址: https://${server_ip}:${existing_port}/${config_webBasePath}${plain}"
+            fi
+        fi
+    else
+        if [[ "$existing_hasDefaultCredential" == "true" ]]; then
+            local config_username=$(gen_random_string 10)
+            local config_password=$(gen_random_string 10)
+            
+            echo -e "${yellow}检测到默认凭据。需要进行安全更新...${plain}"
+            ${xui_folder}/x-ui setting -username "${config_username}" -password "${config_password}"
+            echo -e "已生成新的随机登录凭据:"
+            echo -e "###############################################"
+            echo -e "${green}用户名: ${config_username}${plain}"
+            echo -e "${green}密码: ${config_password}${plain}"
+            echo -e "###############################################"
+        else
+            echo -e "${green}用户名、密码和访问路径已正确设置。${plain}"
+        fi
+
+        # 已有安装: 如果未配置证书, 提示用户设置域名或自签名
+        # 通过检查cert:行是否存在且其后有内容来正确检测空证书
+        existing_cert=$(${xui_folder}/x-ui setting -getCert true | grep 'cert:' | awk -F': ' '{print $2}' | tr -d '[:space:]')
+        if [[ -z "$existing_cert" ]]; then
+            echo ""
+            echo -e "${green}═══════════════════════════════════════════${plain}"
+            echo -e "${green}     SSL 证书设置 (推荐)   ${plain}"
+            echo -e "${green}═══════════════════════════════════════════${plain}"
+            echo -e "${yellow}Let's Encrypt需要一个域名 (不签发IP证书)。${plain}"
+            echo ""
+            prompt_and_setup_ssl "${existing_port}" "${existing_webBasePath}" "${server_ip}"
+            echo -e "${green}访问地址:  https://${SSL_HOST}:${existing_port}/${existing_webBasePath}${plain}"
+        else
+            echo -e "${green}SSL证书已配置。无需操作。${plain}"
+        fi
+    fi
+    
+    ${xui_folder}/x-ui migrate
+}
+
+install_x-ui() {
+    cd ${xui_folder%/x-ui}/
+    
+    # 下载资源
+    if [ $# == 0 ]; then
+        tag_version=$(curl -Ls "https://api.github.com/repos/MHSanaei/3x-ui/releases/latest" | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/')
+        if [[ ! -n "$tag_version" ]]; then
+            echo -e "${yellow}正在尝试使用IPv4获取版本...${plain}"
+            tag_version=$(curl -4 -Ls "https://api.github.com/repos/MHSanaei/3x-ui/releases/latest" | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/')
+            if [[ ! -n "$tag_version" ]]; then
+                echo -e "${red}获取x-ui版本失败,可能是由于GitHub API限制,请稍后再试${plain}"
+                exit 1
+            fi
+        fi
+        echo -e "获取到x-ui最新版本: ${tag_version}, 开始安装..."
+        curl -4fLRo ${xui_folder}-linux-$(arch).tar.gz -z ${xui_folder}-linux-$(arch).tar.gz https://github.com/MHSanaei/3x-ui/releases/download/${tag_version}/x-ui-linux-$(arch).tar.gz
+        if [[ $? -ne 0 ]]; then
+            echo -e "${red}下载x-ui失败, 请确保您的服务器可以访问GitHub ${plain}"
+            exit 1
+        fi
+    else
+        tag_version=$1
+        tag_version_numeric=${tag_version#v}
+        min_version="2.3.5"
+        
+        if [[ "$(printf '%s\n' "$min_version" "$tag_version_numeric" | sort -V | head -n1)" != "$min_version" ]]; then
+            echo -e "${red}请使用更新的版本 (至少 v2.3.5)。正在退出安装。${plain}"
+            exit 1
+        fi
+        
+        url="https://github.com/MHSanaei/3x-ui/releases/download/${tag_version}/x-ui-linux-$(arch).tar.gz"
+        echo -e "开始安装 x-ui $1"
+        curl -4fLRo ${xui_folder}-linux-$(arch).tar.gz -z ${xui_folder}-linux-$(arch).tar.gz ${url}
+        if [[ $? -ne 0 ]]; then
+            echo -e "${red}下载 x-ui $1 失败, 请检查版本是否存在 ${plain}"
+            exit 1
+        fi
+    fi
+    curl -4fLRo /usr/bin/x-ui-temp https://raw.githubusercontent.com/MHSanaei/3x-ui/main/x-ui.sh
+    if [[ $? -ne 0 ]]; then
+        echo -e "${red}下载 x-ui.sh 失败${plain}"
+        exit 1
+    fi
+    
+    # 停止x-ui服务并移除旧资源
+    if [[ -e ${xui_folder}/ ]]; then
+        if [[ $release == "alpine" ]]; then
+            rc-service x-ui stop
+        else
+            systemctl stop x-ui
+        fi
+        rm ${xui_folder}/ -rf
+    fi
+    
+    # 解压资源并设置权限
+    tar zxvf x-ui-linux-$(arch).tar.gz
+    rm x-ui-linux-$(arch).tar.gz -f
+    
+    cd x-ui
+    chmod +x x-ui
+    chmod +x x-ui.sh
+    
+    # 检查系统架构并相应地重命名文件
+    if [[ $(arch) == "armv5" || $(arch) == "armv6" || $(arch) == "armv7" ]]; then
+        mv bin/xray-linux-$(arch) bin/xray-linux-arm
+        chmod +x bin/xray-linux-arm
+    fi
+    chmod +x x-ui bin/xray-linux-$(arch)
+    
+    # 更新 x-ui cli 并设置权限
+    mv -f /usr/bin/x-ui-temp /usr/bin/x-ui
+    chmod +x /usr/bin/x-ui
+    mkdir -p /var/log/x-ui
+    config_after_install
+
+    # Etckeeper 兼容性
+    if [ -d "/etc/.git" ]; then
+        if [ -f "/etc/.gitignore" ]; then
+            if ! grep -q "x-ui/x-ui.db" "/etc/.gitignore"; then
+                echo "" >> "/etc/.gitignore"
+                echo "x-ui/x-ui.db" >> "/etc/.gitignore"
+                echo -e "${green}已为 etckeeper 将 x-ui.db 添加到 /etc/.gitignore${plain}"
+            fi
+        else
+            echo "x-ui/x-ui.db" > "/etc/.gitignore"
+            echo -e "${green}已创建 /etc/.gitignore 并为 etckeeper 添加 x-ui.db${plain}"
+        fi
+    fi
+    
+    if [[ $release == "alpine" ]]; then
+        curl -4fLRo /etc/init.d/x-ui https://raw.githubusercontent.com/MHSanaei/3x-ui/main/x-ui.rc
+        if [[ $? -ne 0 ]]; then
+            echo -e "${red}下载 x-ui.rc 失败${plain}"
+            exit 1
+        fi
+        chmod +x /etc/init.d/x-ui
+        rc-update add x-ui
+        rc-service x-ui start
+    else
+        # 安装 systemd 服务文件
+        service_installed=false
+        
+        if [ -f "x-ui.service" ]; then
+            echo -e "${green}在解压文件中找到 x-ui.service, 正在安装...${plain}"
+            cp -f x-ui.service ${xui_service}/ >/dev/null 2>&1
+            if [[ $? -eq 0 ]]; then
+                service_installed=true
+            fi
+        fi
+        
+        if [ "$service_installed" = false ]; then
+            case "${release}" in
+                ubuntu | debian | armbian)
+                    if [ -f "x-ui.service.debian" ]; then
+                        echo -e "${green}在解压文件中找到 x-ui.service.debian, 正在安装...${plain}"
+                        cp -f x-ui.service.debian ${xui_service}/x-ui.service >/dev/null 2>&1
+                        if [[ $? -eq 0 ]]; then
+                            service_installed=true
+                        fi
+                    fi
+                ;;
+                *)
+                    if [ -f "x-ui.service.rhel" ]; then
+                        echo -e "${green}在解压文件中找到 x-ui.service.rhel, 正在安装...${plain}"
+                        cp -f x-ui.service.rhel ${xui_service}/x-ui.service >/dev/null 2>&1
+                        if [[ $? -eq 0 ]]; then
+                            service_installed=true
+                        fi
+                    fi
+                ;;
+            esac
+        fi
+        
+        # 如果在tar.gz中未找到服务文件, 则从GitHub下载
+        if [ "$service_installed" = false ]; then
+            echo -e "${yellow}在tar.gz中未找到服务文件, 正在从GitHub下载...${plain}"
+            case "${release}" in
+                ubuntu | debian | armbian)
+                    curl -4fLRo ${xui_service}/x-ui.service https://raw.githubusercontent.com/MHSanaei/3x-ui/main/x-ui.service.debian >/dev/null 2>&1
+                ;;
+                *)
+                    curl -4fLRo ${xui_service}/x-ui.service https://raw.githubusercontent.com/MHSanaei/3x-ui/main/x-ui.service.rhel >/dev/null 2>&1
+                ;;
+            esac
+            
+            if [[ $? -ne 0 ]]; then
+                echo -e "${red}从GitHub安装 x-ui.service 失败${plain}"
+                exit 1
+            fi
+            service_installed=true
+        fi
+        
+        if [ "$service_installed" = true ]; then
+            echo -e "${green}正在设置 systemd 单元...${plain}"
+            chown root:root ${xui_service}/x-ui.service >/dev/null 2>&1
+            chmod 644 ${xui_service}/x-ui.service >/dev/null 2>&1
+            systemctl daemon-reload
+            systemctl enable x-ui
+            systemctl start x-ui
+        else
+            echo -e "${red}安装 x-ui.service 文件失败${plain}"
+            exit 1
+        fi
+    fi
+    
+    echo -e "${green}x-ui ${tag_version}${plain} 安装完成, 正在运行..."
+    echo -e ""
+    echo -e "┌───────────────────────────────────────────────────────┐
+│  ${blue}x-ui 控制菜单用法 (子命令):${plain}              │
+│                                                       │
+│  ${blue}x-ui${plain}              - 显示管理菜单                   │
+│  ${blue}x-ui start${plain}        - 启动 x-ui 面板                 │
+│  ${blue}x-ui stop${plain}         - 停止 x-ui 面板                 │
+│  ${blue}x-ui restart${plain}      - 重启 x-ui 面板                 │
+│  ${blue}x-ui status${plain}       - 查看 x-ui 状态                 │
+│  ${blue}x-ui settings${plain}     - 查看当前面板设置               │
+│  ${blue}x-ui enable${plain}       - 设置 x-ui 开机自启             │
+│  ${blue}x-ui disable${plain}      - 取消 x-ui 开机自启             │
+│  ${blue}x-ui log${plain}          - 查看 x-ui 日志                 │
+│  ${blue}x-ui banlog${plain}       - 查看 Fail2ban 封禁日志         │
+│  ${blue}x-ui update${plain}       - 更新 x-ui 面板                 │
+│  ${blue}x-ui legacy${plain}       - 安装旧版本                     │
+│  ${blue}x-ui install${plain}      - 安装 x-ui 面板                 │
+│  ${blue}x-ui uninstall${plain}    - 卸载 x-ui 面板                 │
+└───────────────────────────────────────────────────────┘"
+}
+
+echo -e "${green}正在运行...${plain}"
+install_base
+install_x-ui $1

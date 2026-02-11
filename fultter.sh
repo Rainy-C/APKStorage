@@ -1,210 +1,189 @@
+cat > flutter_full.sh <<'SH'
 #!/usr/bin/env bash
 set -euo pipefail
 
-P(){ printf "%s\n" "$*"; }
-DIE(){ P "[ERR] $*"; exit 1; }
+ts(){ date "+%Y-%m-%d %H:%M:%S"; }
+ok(){ echo "[OK] $*"; }
+info(){ echo "[..] $*"; }
+err(){ echo "[ERR] $*" >&2; }
+die(){ err "$*"; exit 1; }
 
-SDK_DIR="/opt/android-sdk"
-FLUTTER_DIR="/opt/flutter"
-FLUTTER_USER="flutter"
-
-SDK_API="36"
-BUILD_TOOLS="28.0.3"
-
-ensure_root(){
-  [[ "${EUID:-$(id -u)}" -eq 0 ]] || DIE "请用 root 运行（sudo -i 后再跑）"
+require_root(){
+  [ "$(id -u)" -eq 0 ] || die "请用 root 执行：sudo bash $0"
 }
 
 ensure_user(){
-  if id "$FLUTTER_USER" >/dev/null 2>&1; then
-    P "[OK] 用户已存在：$FLUTTER_USER"
+  local u="$1"
+  if ! id "$u" >/dev/null 2>&1; then
+    useradd -m -s /bin/bash "$u"
+    ok "用户就绪：$u"
   else
-    useradd -m -s /bin/bash "$FLUTTER_USER"
-    P "[OK] 用户就绪：$FLUTTER_USER"
+    ok "用户已存在：$u"
   fi
 }
 
-write_profile(){
-  cat >/etc/profile.d/flutter_env.sh <<EOF
-export FLUTTER_HOME="$FLUTTER_DIR"
-export ANDROID_SDK_ROOT="$SDK_DIR"
-export ANDROID_HOME="$SDK_DIR"
-export PATH="\$FLUTTER_HOME/bin:\$ANDROID_SDK_ROOT/platform-tools:\$ANDROID_SDK_ROOT/cmdline-tools/latest/bin:\$PATH"
-EOF
-  chmod 0644 /etc/profile.d/flutter_env.sh
-  P "[OK] 已写入 /etc/profile.d/flutter_env.sh"
+write_env(){
+  local f="$1"
+  shift
+  mkdir -p "$(dirname "$f")"
+  : > "$f"
+  for line in "$@"; do
+    echo "$line" >> "$f"
+  done
 }
 
-choose_proxy(){
-  P ""
-  P "=============================="
-  P " Flutter 一键部署（交互版）"
-  P "=============================="
-  P ""
-  P "是否启用代理？"
-  P "  1) 启用（socks5h/http 代理）"
-  P "  2) 不启用"
-  P ""
-  read -r -p "请输入选项 [1-2]：" opt || true
-  opt="${opt:-2}"
+proxy_menu(){
+  echo "=============================="
+  echo "是否启用代理？"
+  echo "1) 启用（SOCKS5：socks5h://IP:PORT）"
+  echo "2) 不启用"
+  read -rp "请选择 [1/2]: " _p || true
+  _p="${_p:-2}"
 
-  if [[ "$opt" == "1" ]]; then
-    read -r -p "请输入代理地址（例：socks5h://18.183.63.49:3233 或 http://127.0.0.1:8118）：" PROXY || true
-    PROXY="${PROXY:-}"
-    [[ -z "$PROXY" ]] && DIE "你选了启用代理，但没有输入代理地址"
-
-    cat >/etc/profile.d/proxy.sh <<EOF
-export ALL_PROXY="$PROXY"
-export HTTPS_PROXY="$PROXY"
-export HTTP_PROXY="$PROXY"
-export NO_PROXY="127.0.0.1,localhost,::1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16"
-EOF
-    chmod 0644 /etc/profile.d/proxy.sh
-    P "[OK] 代理已启用：$PROXY"
-    P "[OK] 已写入 /etc/profile.d/proxy.sh"
-
-    if [[ "$PROXY" == socks5* ]]; then
-      P "[..] 提示：Android sdkmanager 不支持 socks5/socks5h，脚本会在装 SDK 时自动绕开 HTTP(S)_PROXY"
-    fi
+  if [ "$_p" = "1" ]; then
+    read -rp "请输入代理地址（例：socks5h://18.183.63.49:3233）: " PROXY_URL || true
+    [ -n "${PROXY_URL:-}" ] || die "代理地址为空"
+    export ALL_PROXY="$PROXY_URL"
+    export HTTPS_PROXY="$PROXY_URL"
+    export HTTP_PROXY="$PROXY_URL"
+    write_env /etc/profile.d/proxy.sh \
+      "export ALL_PROXY=$PROXY_URL" \
+      "export HTTPS_PROXY=$PROXY_URL" \
+      "export HTTP_PROXY=$PROXY_URL"
+    ok "代理已启用：$PROXY_URL"
+    ok "已写入 /etc/profile.d/proxy.sh"
   else
-    rm -f /etc/profile.d/proxy.sh 2>/dev/null || true
-    P "[OK] 不启用代理"
+    unset ALL_PROXY HTTPS_PROXY HTTP_PROXY || true
+    rm -f /etc/profile.d/proxy.sh || true
+    ok "不使用代理"
   fi
 }
 
-install_deps(){
-  P "[..] 安装基础依赖"
+apt_install(){
+  info "安装基础依赖"
   export DEBIAN_FRONTEND=noninteractive
   apt-get update -y >/dev/null
   apt-get install -y --no-install-recommends \
-    ca-certificates curl git unzip xz-utils zip \
-    openjdk-17-jdk \
-    libglu1-mesa \
+    ca-certificates curl git unzip zip xz-utils \
+    libglu1-mesa openjdk-17-jdk-headless \
+    python3 python3-venv \
     >/dev/null
-  P "[OK] 依赖安装完成"
+  ok "依赖安装完成"
 }
 
-install_android_sdk(){
-  if [[ -d "$SDK_DIR" && -x "$SDK_DIR/cmdline-tools/latest/bin/sdkmanager" ]]; then
-    P "[OK] Android SDK 已存在：$SDK_DIR"
+setup_flutter(){
+  local FLUTTER_DIR="/opt/flutter"
+  local u="flutter"
+
+  if [ ! -d "$FLUTTER_DIR/.git" ]; then
+    info "拉取 Flutter stable 到 $FLUTTER_DIR"
+    rm -rf "$FLUTTER_DIR" || true
+    git clone -b stable https://github.com/flutter/flutter.git "$FLUTTER_DIR"
+    ok "Flutter 源码已就绪"
   else
-    P "[..] 安装 Android SDK 到：$SDK_DIR"
-    mkdir -p "$SDK_DIR"
-    cd /tmp
-
-    URL="https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip"
-    P "[..] 下载 cmdline-tools"
-    curl -fL --retry 3 --retry-delay 2 -o cmdline-tools.zip "$URL"
-
-    rm -rf "$SDK_DIR/cmdline-tools"
-    mkdir -p "$SDK_DIR/cmdline-tools"
-    unzip -q cmdline-tools.zip -d "$SDK_DIR/cmdline-tools"
-    rm -f cmdline-tools.zip
-
-    if [[ -d "$SDK_DIR/cmdline-tools/cmdline-tools" ]]; then
-      mv "$SDK_DIR/cmdline-tools/cmdline-tools" "$SDK_DIR/cmdline-tools/latest"
-    elif [[ -d "$SDK_DIR/cmdline-tools/latest" ]]; then
-      :
-    else
-      DIE "cmdline-tools 解压结构异常"
-    fi
-
-    P "[OK] cmdline-tools 已安装"
+    ok "Flutter 已存在：$FLUTTER_DIR"
   fi
 
-  SDKM="$SDK_DIR/cmdline-tools/latest/bin/sdkmanager"
+  chown -R "$u:$u" "$FLUTTER_DIR"
 
-  mkdir -p "$SDK_DIR/licenses"
-  chmod -R a+rX "$SDK_DIR"
-  chown -R root:root "$SDK_DIR"
+  write_env /etc/profile.d/flutter.sh \
+    "export PATH=/opt/flutter/bin:\$PATH" \
+    "export FLUTTER_ROOT=/opt/flutter"
+  ok "已写入 /etc/profile.d/flutter.sh"
+}
 
-  P "[..] 接受 licenses"
-  if [[ "${HTTPS_PROXY:-}" == socks5* || "${HTTP_PROXY:-}" == socks5* ]]; then
-    ( unset HTTP_PROXY HTTPS_PROXY; yes | "$SDKM" --sdk_root="$SDK_DIR" --licenses >/dev/null || true )
+android_sdk_install(){
+  local SDK="/opt/android-sdk"
+  local u="flutter"
+
+  if [ ! -d "$SDK" ]; then
+    info "安装 Android SDK 到 $SDK"
+    mkdir -p "$SDK"
+    chown -R "$u:$u" "$SDK"
   else
-    yes | "$SDKM" --sdk_root="$SDK_DIR" --licenses >/dev/null || true
+    ok "Android SDK 目录已存在：$SDK"
   fi
 
-  P "[..] 安装 platforms/build-tools"
-  if [[ "${HTTPS_PROXY:-}" == socks5* || "${HTTP_PROXY:-}" == socks5* ]]; then
-    ( unset HTTP_PROXY HTTPS_PROXY; "$SDKM" --sdk_root="$SDK_DIR" \
-      "platform-tools" \
-      "platforms;android-${SDK_API}" \
-      "build-tools;${BUILD_TOOLS}" >/dev/null )
-  else
-    "$SDKM" --sdk_root="$SDK_DIR" \
-      "platform-tools" \
-      "platforms;android-${SDK_API}" \
-      "build-tools;${BUILD_TOOLS}" >/dev/null
-  fi
+  write_env /etc/profile.d/android-sdk.sh \
+    "export ANDROID_SDK_ROOT=$SDK" \
+    "export ANDROID_HOME=$SDK" \
+    "export PATH=$SDK/platform-tools:$SDK/cmdline-tools/latest/bin:\$PATH"
+  ok "已写入 /etc/profile.d/android-sdk.sh"
 
-  P "[OK] Android SDK 安装完成：$SDK_DIR"
+  info "安装 cmdline-tools"
+  local url="https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip"
+  local z="/tmp/cmdline-tools.zip"
+  curl -fsSL "$url" -o "$z"
+  rm -rf "$SDK/cmdline-tools/latest" || true
+  mkdir -p "$SDK/cmdline-tools"
+  unzip -q -o "$z" -d "$SDK/cmdline-tools"
+  mv "$SDK/cmdline-tools/cmdline-tools" "$SDK/cmdline-tools/latest"
+  chown -R "$u:$u" "$SDK"
+  ok "cmdline-tools 已安装"
+
+  info "接受 licenses"
+  yes | "$SDK/cmdline-tools/latest/bin/sdkmanager" --sdk_root="$SDK" --licenses >/dev/null || true
+  ok "licenses 已处理"
+
+  info "安装 platforms/build-tools（注意：sdkmanager 不支持 socks5h 环境变量，自动关闭代理）"
+  HTTP_PROXY= HTTPS_PROXY= ALL_PROXY= \
+  "$SDK/cmdline-tools/latest/bin/sdkmanager" --sdk_root="$SDK" \
+    "platform-tools" \
+    "platforms;android-36" \
+    "build-tools;35.0.1" \
+    >/dev/null
+  ok "platforms/build-tools 安装完成"
 }
 
-install_flutter(){
-  if [[ -x "$FLUTTER_DIR/bin/flutter" ]]; then
-    P "[OK] Flutter 已存在：$FLUTTER_DIR"
-  else
-    P "[..] 安装 Flutter 到：$FLUTTER_DIR"
-    cd /opt
+flutter_bootstrap(){
+  local u="flutter"
+  local SDK="/opt/android-sdk"
 
-    if [[ -d flutter/.git ]]; then
-      rm -rf flutter
-    fi
+  info "初始化 flutter 用户目录权限"
+  su - "$u" -c 'mkdir -p ~/.android ~/.gradle && touch ~/.android/repositories.cfg && chmod -R u+rwX ~/.android ~/.gradle' >/dev/null || true
+  ok "用户目录就绪"
 
-    git clone https://github.com/flutter/flutter.git -b stable flutter
-    mv flutter "$FLUTTER_DIR"
-    P "[OK] Flutter clone 完成"
-  fi
+  info "配置 flutter（禁用 web/linux-desktop）"
+  su - "$u" -c 'source /etc/profile.d/flutter.sh && flutter config --no-enable-web --no-enable-linux-desktop' >/dev/null
+  ok "flutter config 完成"
 
-  chown -R "$FLUTTER_USER":"$FLUTTER_USER" "$FLUTTER_DIR"
-  P "[OK] Flutter 权限修正完成"
-}
+  info "指向 Android SDK"
+  su - "$u" -c "source /etc/profile.d/flutter.sh && flutter config --android-sdk $SDK" >/dev/null
+  ok "flutter config --android-sdk 完成"
 
-flutter_config_pre(){
-  P "[..] 配置 Flutter（禁用 web/linux-desktop，减少依赖）"
-  su - "$FLUTTER_USER" -c "source /etc/profile.d/flutter_env.sh >/dev/null 2>&1 || true; flutter config --no-enable-web --no-enable-linux-desktop >/dev/null 2>&1 || true"
-  P "[OK] Flutter config 完成"
-}
+  info "预下载 Android 相关缓存（可能较久）"
+  su - "$u" -c 'source /etc/profile.d/flutter.sh && flutter precache --android' || die "flutter precache 失败"
+  ok "precache 完成"
 
-flutter_preflight(){
-  P "[..] 初始化 flutter 用户目录"
-  su - "$FLUTTER_USER" -c "mkdir -p ~/.android ~/.gradle && touch ~/.android/repositories.cfg && chmod -R u+rwX ~/.android ~/.gradle"
-  P "[OK] flutter 用户目录就绪"
-}
-
-flutter_doctor(){
-  P "[..] flutter doctor"
-  su - "$FLUTTER_USER" -c "source /etc/profile.d/flutter_env.sh >/dev/null 2>&1 || true; flutter --version"
-  su - "$FLUTTER_USER" -c "source /etc/profile.d/flutter_env.sh >/dev/null 2>&1 || true; flutter doctor -v || true"
-  P "[OK] doctor 已执行"
+  info "flutter doctor"
+  su - "$u" -c 'source /etc/profile.d/flutter.sh && flutter doctor' || true
+  ok "doctor 已输出（若无设备提示正常）"
 }
 
 main(){
-  ensure_root
-  choose_proxy
-  install_deps
-  ensure_user
-  write_profile
-  install_android_sdk
-  install_flutter
-  flutter_preflight
-  flutter_config_pre
-  flutter_doctor
+  require_root
+  echo "[`ts`] Flutter 一键部署开始"
 
-  P ""
-  P "=============================="
-  P "[OK] Flutter 环境部署完成"
-  P "Flutter：$FLUTTER_DIR"
-  P "Android SDK：$SDK_DIR"
-  P "用户：$FLUTTER_USER"
-  P "=============================="
-  P ""
-  P "以后编译建议："
-  P "  su - flutter"
-  P "  cd 你的项目目录"
-  P "  flutter pub get"
-  P "  flutter build apk --release"
+  proxy_menu
+  apt_install
+  ensure_user flutter
+  setup_flutter
+  android_sdk_install
+  flutter_bootstrap
+
+  echo "=============================="
+  ok "完成 ✅"
+  echo "使用方式："
+  echo "  1) 重新登录一次 shell（让 /etc/profile.d 生效）"
+  echo "  2) 用 flutter 用户执行："
+  echo "     su - flutter"
+  echo "     flutter --version"
+  echo "     flutter doctor"
 }
 
 main "$@"
+SH
+
+chmod +x flutter_full.sh
+echo "[OK] 已生成 ./flutter_full.sh"
+echo "运行：sudo bash ./flutter_full.sh"
